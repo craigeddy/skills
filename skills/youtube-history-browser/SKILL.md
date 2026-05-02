@@ -20,17 +20,18 @@ description: >-
 
 ## What this skill does
 
-Opens the user's YouTube watch history page (`https://www.youtube.com/feed/history`) in their connected Chrome browser, reads the page, and produces a clean grouped-by-day list of videos they've watched within a requested window of days.
+Opens the user's YouTube watch history page (`https://www.youtube.com/feed/history`) in their connected Chrome browser, reads the JSON payload baked into the page, and produces a clean grouped-by-day list of videos they've watched within a requested window of days.
 
-YouTube renders watch history as a single page broken into date sections — the most recent section is labelled `Today`, then `Yesterday`, then specific weekday names ("Saturday", "Friday", ...), and eventually full dates further back. Each section contains video cards with a title, channel, runtime, and view count. This skill walks those sections and extracts what the user wants.
+YouTube's history page ships with the *entire* list of date sections in a single `window.ytInitialData` object on initial load — typically months of history, far more than the rendered DOM ever virtualizes. This skill reads from that JSON directly. It is both more complete and faster than scrolling the page.
 
 ## Inputs
 
-The skill takes one optional parameter, **days**, controlling how far back to look:
+The skill takes one optional parameter, **days**, interpreted as "include sections whose date falls within the last N calendar days, today inclusive":
 
 - `days = 1` (default, also matches "today") — only the `Today` section.
 - `days = 2` — `Today` + `Yesterday`.
-- `days = N` for N ≥ 3 — `Today`, `Yesterday`, and the next N-2 prior date sections in the page order, regardless of whether they're labelled by weekday or full date.
+- `days = 7` — covers the past week.
+- `days = N` for arbitrary N — all sections whose date is `>= today − (N − 1)`.
 
 If the user phrases it differently ("last week", "past 3 days", "everything since Monday"), translate that into a `days` integer before running. Ask the user only if the phrasing is genuinely ambiguous — the user prefers precision, so when in doubt confirm with one short question rather than guessing.
 
@@ -42,42 +43,140 @@ Before navigating, confirm the Claude in Chrome MCP has at least one connected b
 
 If a tab group doesn't exist for the session yet, call `tabs_context_mcp` with `createIfEmpty: true` to bootstrap one. Reuse the empty tab it creates rather than spawning extra tabs.
 
-### 2. Navigate to the watch history page
+### 2. Navigate and spoof visibility
 
-Navigate the active tab to `https://www.youtube.com/feed/history`. Then call `read_page` on that tab with `filter: "all"` — `get_page_text` returns very little here because the history list is rendered as virtualized cards rather than article text, so the accessibility tree from `read_page` is the reliable source.
+Navigate the active tab to `https://www.youtube.com/feed/history`.
 
-If the read shows the user is not signed in (no `Watch history` heading, or YouTube is showing the sign-in prompt instead of history cards), stop and tell the user: they need to sign into YouTube in the connected browser before this can work. Do not attempt to log them in.
+**Critical:** the Cowork-connected tab is almost always a *background* tab from Chrome's perspective, so `document.visibilityState === "hidden"`. YouTube's SPA refuses to mount `ytd-browse` or populate the section list in hidden tabs — the page will look stuck or completely empty even after waiting many seconds. Immediately after navigating, run this in the tab via `javascript_tool`:
 
-### 3. Parse the sections
+```js
+new Promise(r => setTimeout(r, 6000)).then(() => {
+  try {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  } catch (e) {}
+  return {
+    ready: !!window.ytInitialData,
+    sectionCount: window.ytInitialData
+      ? window.ytInitialData.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.length
+      : 0
+  };
+})
+```
 
-In the accessibility tree, watch history items appear as a flat sequence under the `main` region. The structure is roughly:
+If `ready` is false, sleep a few more seconds and re-check. If after ~15s `ytInitialData` is still missing, fall through to the DOM-scrape fallback in section 6.
 
-- A `generic "Today"` (or `"Yesterday"`, or a date string) marks the start of a section.
-- Then for each video in that section: a `link` whose nested `generic` holds the runtime (e.g. `"21:50"`), a `button "Go to channel <Channel Name>"` (or a `link "Collaboration channels"` for multi-creator videos), a `heading` containing the title, and a `group` containing the channel name text and view count.
+If the page is showing the signed-out screen instead, stop and tell the user to sign into YouTube in the connected browser. Do not attempt to log them in.
 
-Walk the items in order. Whenever a section header `generic` is encountered, switch the "current section" label. For each video record, capture: title, channel(s), runtime, view count, and the `href` from the link (so the user can click through). Strip query parameters that are tracking noise but keep the `v=` video ID and `t=` timestamp if present, since the timestamp tells the user where they left off.
+### 3. Read the section list from `ytInitialData`
 
-For multi-creator videos where the button reads `"Collaboration channels"`, the channel names appear inside the `group` under a nested `generic` like `"AI Engineer and Matt Pocock"`. Capture that text verbatim.
+The full date-grouped section list lives at:
 
-### 4. Apply the days window
+```
+window.ytInitialData
+  .contents.twoColumnBrowseResultsRenderer
+  .tabs[0].tabRenderer.content
+  .sectionListRenderer.contents
+```
 
-Determine which sections to include:
+Each entry is either an `itemSectionRenderer` (a date section) or a `continuationItemRenderer` (the lazy-load sentinel — ignore it; the initial payload typically already contains months of history, far more than any reasonable `days` window).
 
-- The first section in document order is always `Today`.
-- The second section, if present, is always `Yesterday`.
-- Subsequent sections are older days.
+For each `itemSectionRenderer`:
 
-Truncate the section list at `days` entries. If the page has fewer sections than `days` (e.g. user only has 2 days of history), include what exists and mention the cap in the response so the user knows you didn't silently miss anything.
+- **Header label** — `.header.itemSectionHeaderRenderer.title.simpleText`, or `.title.runs[0].text`. Possible shapes: `"Today"`, `"Yesterday"`, a weekday name (e.g. `"Thursday"`), or a full date (e.g. `"Apr 25"`, `"Jan 3"`).
+- **Items** — `.contents` array; each item is one of the three renderer shapes documented in section 4.
 
-### 5. (Only if needed) Scroll for more history
+### 4. Parse each item
 
-If `days` exceeds the number of sections currently rendered, scroll the page down to trigger YouTube's lazy load and re-read. A reasonable approach: use `javascript_tool` to call `window.scrollTo(0, document.body.scrollHeight)`, wait briefly, then `read_page` again. Repeat until you have enough sections or two consecutive scrolls return no new sections (in which case you've hit the end of the user's history).
+Three renderer shapes appear inside a section. Handle all three.
 
-Don't scroll preemptively when `days = 1` — the Today section is rendered immediately, and unnecessary scrolling slows the response and risks pulling in irrelevant content.
+#### `lockupViewModel` (modern shape, most items)
 
-### 6. Format the response
+```js
+function parseLockup(lvm) {
+  const meta = lvm.metadata?.lockupMetadataViewModel;
+  const title = meta?.title?.content || '';
+  const id = lvm.contentId || '';
+  const rows = meta?.metadata?.contentMetadataViewModel?.metadataRows || [];
+  // First row: channel name(s); second row: view count etc.
+  const channel = (rows[0]?.metadataParts || [])
+    .map(p => p.text?.content)
+    .filter(Boolean)
+    .filter(t => !/views?$/i.test(t))
+    .join(' & ');
+  let runtime = '';
+  for (const o of lvm.contentImage?.thumbnailViewModel?.overlays || []) {
+    for (const b of o.thumbnailBottomOverlayViewModel?.badges || []) {
+      const t = b.thumbnailBadgeViewModel?.text;
+      if (t && /^\d/.test(t)) runtime = t;
+    }
+  }
+  return { title, id, channel, runtime, kind: 'video' };
+}
+```
 
-Present the result grouped by section, with the section label as a small header and each video as a single line containing title, channel, and runtime. Include the YouTube link on the title so the user can click through. Keep view counts out of the main list — they're rarely what the user cares about — but offer to include them if they ask. Example shape:
+Video URL: `https://www.youtube.com/watch?v=${id}`.
+
+#### `videoRenderer` (older shape, still appears occasionally)
+
+```js
+function parseVideoRenderer(vr) {
+  return {
+    title: vr.title?.runs?.[0]?.text || vr.title?.simpleText || '',
+    id: vr.videoId || '',
+    channel: vr.ownerText?.runs?.map(r => r.text).join(', ')
+      || vr.longBylineText?.runs?.map(r => r.text).filter(t => t.trim() && t !== ' and ').join(' and ')
+      || '',
+    runtime: vr.lengthText?.simpleText || '',
+    kind: 'video'
+  };
+}
+```
+
+#### `reelShelfRenderer` (a horizontal shelf of Shorts)
+
+A single `reelShelfRenderer` represents *all* of that day's Shorts in one shelf. Expand it into multiple items:
+
+```js
+function parseReelShelf(rs) {
+  return (rs.items || []).map(i => {
+    const v = i.shortsLockupViewModel;
+    if (!v) return null;
+    const id = v.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId
+      || v.entityId?.split('/').pop()
+      || '';
+    return {
+      title: v.overlayMetadata?.primaryText?.content || '',
+      id,
+      channel: v.overlayMetadata?.secondaryText?.content || '(Shorts)',
+      runtime: 'Short',
+      kind: 'short'
+    };
+  }).filter(Boolean);
+}
+```
+
+Shorts URL: `https://www.youtube.com/shorts/${id}` (not `/watch?v=`).
+
+### 5. Apply the date window
+
+Resolve each section header to a real date based on today:
+
+- `"Today"` → today
+- `"Yesterday"` → today − 1
+- Weekday name (`"Monday"` … `"Sunday"`) → the most recent past occurrence of that weekday. YouTube only uses weekday names for days 2–7 ago, so this is always within the last week.
+- Full date (`"Apr 25"`, `"Jan 3"`) → that calendar date in the most recent past year.
+
+Sections come in document order, newest first. Walk them and keep those whose date is `>= today − (days − 1)`. Stop walking once you hit an older section.
+
+### 6. Fallback: DOM scrape (only if `ytInitialData` is unavailable)
+
+This should be rare. If after spoofing visibility and waiting ~15s `window.ytInitialData` is still undefined or empty, fall back to scrolling the page and reading the rendered DOM. Use `javascript_tool` to scroll the last `ytd-item-section-renderer` into view, wait, and repeat until two consecutive scrolls produce no new sections. Then read items from `yt-lockup-view-model` (with `ytd-video-renderer` and `ytd-reel-shelf-renderer` as alternates) — the per-element schema mirrors the JSON described in section 4.
+
+### 7. Format the response
+
+Present the result grouped by section, with the section label as a small header and each video as a single line containing title, channel, and runtime. Wrap the title in a Markdown link to the YouTube URL so the user can click through. Keep view counts out of the main list — they're rarely what the user cares about — but offer to include them if they ask. Example shape:
 
 ```
 **Today**
@@ -92,13 +191,13 @@ End with a brief one-sentence observation about the day's viewing if there's an 
 
 ## Edge cases
 
-- **Empty Today section**: YouTube still renders a `Today` heading even if the user hasn't watched anything yet that day, in which case the next item in the tree is the `Yesterday` heading. Handle this by treating any section with zero videos as empty rather than erroring.
-- **Shorts vs. long-form**: The history page has tabs for All / Videos / Shorts / Podcasts / Music. Default to All. If the user asks for a specific category, click the matching tab via its accessibility ref before reading.
-- **History paused**: If the user has YouTube watch history paused, the page shows a "Your watch history is off" message instead of the list. Report this clearly — there is nothing to extract.
-- **Non-English UI**: Section labels may be localized ("Hoy", "Aujourd'hui"). If the labels don't match the expected English strings, fall back to "the first/second/Nth section in order" and mention the localization in the response so the user knows you weren't strict about matching.
+- **Empty Today section**: YouTube still renders a `Today` heading even if the user hasn't watched anything yet today. Treat sections with zero items as empty rather than erroring.
+- **Shorts vs. long-form**: The history page has tabs for All / Videos / Shorts / Podcasts / Music. Default to All. If the user asks for a specific category, click the matching tab via its accessibility ref before reading; the category filter applies to both the JSON payload and the DOM fallback.
+- **History paused**: If the user has YouTube watch history paused, the page shows a "Your watch history is off" message and `sectionListRenderer.contents` is empty or contains a `messageRenderer` instead of `itemSectionRenderer` entries. Report this clearly — there is nothing to extract.
+- **Non-English UI**: Section labels may be localized ("Hoy", "Aujourd'hui", localized weekday names). If literal string matching fails, fall back to positional reasoning — first section is today, second is yesterday, sections 3–7 are the prior weekdays in order — and mention the localization in the response so the user knows you weren't strict about matching.
 
 ## What not to do
 
-- Don't attempt to delete entries, clear history, or click "Pause watch history" — those are destructive actions outside the scope of this skill, and they require explicit user confirmation through the chat anyway.
-- Don't sign the user in. If they're signed out, say so and stop.
-- Don't recommend "similar videos" or use the Search box. The user asked what they watched, not what to watch next.
+- Don't attempt to delete entries, clear history, or click "Pause watch history" — those are destructive actions outside the scope of this skill, and they require explicit user confirmation through other channels, not this skill.
+- Don't trust the rendered DOM as the source of truth for how much history exists. It virtualizes aggressively and frequently shows only 1–2 sections even when the underlying JSON has dozens. Always check `ytInitialData` first.
+- Don't report only what the DOM happens to have rendered. An earlier version of this skill did exactly that and silently dropped weeks of relevant history from its answer.
